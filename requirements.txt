@@ -3,6 +3,3 @@ uvicorn[standard]==0.30.1
 python-dotenv==1.0.1
 httpx==0.27.0
 anthropic==0.33.0
-# Install YOUR forks of Gosset code directly from GitHub:
-git+https://github.com/<YOUR_GITHUB_USERNAME>/web-research-agent@main
-git+https://github.com/<YOUR_GITHUB_USERNAME>/mcps@main
