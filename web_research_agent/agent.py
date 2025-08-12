@@ -1,9 +1,32 @@
+from __future__ import annotations
+
 from typing import List, Dict
 import json
-from .utils import (
-    ask_claude, 
-    process_anthropic_response
-)
+import sys
+
+# ---- Compatibility shim -----------------------------------------------------
+# Some upstream files (e.g., utils.py) may import "tools" using an absolute import.
+# Because we've vendored these into a package (web_research_agent/), ensure that
+# "tools" resolves to the sibling module web_research_agent.tools.
+try:
+    from . import tools as _tools  # sibling module
+    # Make it available under the legacy absolute name so "import tools" works.
+    sys.modules.setdefault("tools", _tools)
+except Exception:
+    # If tools isn't needed immediately at import time, it's fine to continue.
+    pass
+
+# Now import from utils using a proper relative import
+try:
+    from .utils import ask_claude, process_anthropic_response
+except Exception as e:
+    raise ImportError(
+        f"Failed to import web_research_agent.utils: {e}. "
+        "If you maintain the source, ensure utils uses relative imports, e.g. "
+        "'from . import tools' instead of 'import tools'."
+    )
+
+# -----------------------------------------------------------------------------
 
 def infer_fields_from_task(task: str) -> List[str]:
     """Infer output fields from the task description using Claude"""
@@ -12,42 +35,40 @@ def infer_fields_from_task(task: str) -> List[str]:
     For example: ["company_name", "revenue", "employee_count"]
     Keep the fields simple and focused on the core information requested.
     """
-    
     try:
         response_text = ask_claude(prompt)
         if not response_text:
             raise ValueError("No response from Claude")
-            
         fields = json.loads(response_text)
-        
+
         # Validate that we got a list of strings
         if not isinstance(fields, list) or not all(isinstance(f, str) for f in fields):
             raise ValueError("Invalid fields format from LLM")
-            
+
         return fields
-        
     except Exception as e:
         print(f"Error inferring fields: {e}")
         # Return default fields if something goes wrong
         return ["name", "description"]
 
+
 def process_single_action(message: str, tools: List[Dict]) -> Dict:
     """Process a single action based on the given message"""
-    print("\n=== Processing action ===")    
-    
+    print("\n=== Processing action ===")
+
     initial_messages = [{
         "role": "user",
         "content": message
     }]
-    
+
     response = process_anthropic_response(initial_messages, tools)
-    
+
     # Handle different response types
     try:
         if isinstance(response.content, list):
             for content in response.content:
-                if content.type == "text":
-                    result = json.loads(content.text)
+                if getattr(content, "type", "") == "text":
+                    result = json.loads(getattr(content, "text", "") or "{}")
                     print("\n✅ Action processed successfully")
                     return result
         print("\n⚠️ No valid response content found")
@@ -56,9 +77,10 @@ def process_single_action(message: str, tools: List[Dict]) -> Dict:
         print(f"\n❌ Error processing response: {e}")
         return {}
 
+
 def process_task(task: str, max_searches: int = 5, max_results: int = 10) -> Dict:
     """Process a task and return results in specified format
-    
+
     Args:
         task: The task description
         max_searches: Maximum number of search iterations to perform
@@ -67,11 +89,11 @@ def process_task(task: str, max_searches: int = 5, max_results: int = 10) -> Dic
     print("\n=== Starting new task ===")
     print(f"Task: {task}")
     print(f"Limits: max {max_searches} searches, max {max_results} results")
-    
+
     # Infer fields from task
     fields = infer_fields_from_task(task)
     print(f"\n📋 Inferred fields: {', '.join(fields)}")
-    
+
     # Define available tools
     tools = [
         {
@@ -128,41 +150,41 @@ If you cannot find information, return empty lists/strings as appropriate."""
 
     # Initial task message with empty action history
     initial_task = TASK_TEMPLATE.format(NEXT_TASK="", ACTION_HISTORY="None")
-    
-    all_results = []
-    action_history = []
+
+    all_results: List[Dict] = []
+    action_history: List[str] = []
 
     # Process actions iteratively until no next_action is provided or limits reached
     current_message = initial_task
     search_count = 0
-    
+    last_result: Dict = {}
+
     while True:
         if search_count >= max_searches:
             print(f"\n🛑 Reached maximum number of searches ({max_searches})")
             break
-            
+
         result = process_single_action(current_message, tools)
         search_count += 1
-        
-        if "results" in result:
-            new_results = result.get("results", [])
+        last_result = result or {}
+
+        if "results" in last_result:
+            new_results = last_result.get("results", [])
             remaining_capacity = max_results - len(all_results)
-            
             if remaining_capacity <= 0:
                 print(f"\n🛑 Reached maximum number of results ({max_results})")
                 break
-                
             # Add only up to the remaining capacity
             all_results.extend(new_results[:remaining_capacity])
-        
+
         # Check if we should continue
-        next_action = result.get("next_action", "")
+        next_action = last_result.get("next_action", "")
         if not next_action:
             break
-        
+
         # Add the next_action to history before executing it
         action_history.append(next_action)
-        
+
         # Update message for next iteration with action history
         action_history_text = "\n".join([f"- {action}" for action in action_history])
         current_message = TASK_TEMPLATE.format(
@@ -170,20 +192,23 @@ If you cannot find information, return empty lists/strings as appropriate."""
             ACTION_HISTORY=action_history_text
         )
 
+    comments = last_result.get("comments", "")
+    if search_count >= max_searches:
+        comments = (comments + "\n" if comments else "") + f"Search limit reached: True"
+
     return {
         "results": all_results,
-        "comments": result.get("comments", "") + (
-            f"\nSearch limit reached: {search_count >= max_searches}" if search_count >= max_searches else ""
-        ),
+        "comments": comments
     }
+
 
 if __name__ == "__main__":
     # Get task from input
     print("Enter the task instructions:")
     task = input().strip()
-    
+
     # Process task with default limits
     result = process_task(task, max_searches=2, max_results=3)
-    
+
     # Print result as JSON
     print(json.dumps(result, indent=2))
