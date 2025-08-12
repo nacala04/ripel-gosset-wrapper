@@ -1,13 +1,12 @@
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
-import os, uuid
+import os, uuid, httpx
 
 API_KEY = os.getenv("PROGRAM_FINDER_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-app = FastAPI(title="RIPEL + Gosset Wrapper (Safe Import)", version="0.3")
+app = FastAPI(title="RIPEL + Gosset Wrapper", version="1.0")
 
-# -------- Models --------
 class QueryBody(BaseModel):
     query: str
     max_searches: int = 2
@@ -16,7 +15,6 @@ class QueryBody(BaseModel):
 class MCPReq(BaseModel):
     query: str
 
-# -------- Health --------
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -24,16 +22,14 @@ def health():
 def unauthorized(auth: str | None):
     return (not API_KEY) or (auth != f"Bearer {API_KEY}")
 
-# -------- Web Research Agent (LIVE, safe import) --------
+# ---- LIVE Gosset Web Research Agent (safe import) ----
 @app.post("/gosset/research")
 def gosset_research(body: QueryBody, authorization: str | None = Header(None)):
     if unauthorized(authorization):
         raise HTTPException(status_code=401, detail="Unauthorized")
-
     if not ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not set in Railway Variables")
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not set")
 
-    # Import inside the handler so startup never crashes
     try:
         from web_research_agent.agent import process_task
     except Exception as e:
@@ -54,37 +50,99 @@ def gosset_research(body: QueryBody, authorization: str | None = Header(None)):
                 "stage": r.get("development_stage") or r.get("stage") or "research",
                 "rationale": r.get("summary") or r.get("comments") or "",
                 "suggested_next_steps": r.get("next_steps", []),
-                "evidence": [{"type": "link", "title": (u or "")[:30], "url": u} for u in r.get("sources", [])],
+                "evidence": [{"type": "link","title": (u or "")[:30], "url": u} for u in r.get("sources", [])],
                 "confidence": 0.6
             })
         return {"query_id": str(uuid.uuid4()), "results": items}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gosset agent error: {e}")
 
-# -------- MCPS placeholders (can be made live later) --------
+# ---- MCPS-style endpoints via public APIs (works from web apps) ----
+# PubMed
 @app.post("/mcps/pubmed")
 def mcps_pubmed(body: MCPReq, authorization: str | None = Header(None)):
     if unauthorized(authorization):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    return {"source":"pubmed","items":[
-        {"id":"pmid_demo_1","title":"SHP2 inhibitors in KRAS tumors","summary":"Review on SHP2.","url":"https://pubmed.ncbi.nlm.nih.gov/00000001/","tags":["paper"]},
-        {"id":"pmid_demo_2","title":"Allosteric pockets of PTPN11","summary":"Allosteric binding.","url":"https://pubmed.ncbi.nlm.nih.gov/00000002/","tags":["paper"]}
-    ]}
+    try:
+        q = body.query.strip()
+        if not q:
+            return {"source":"pubmed","items":[]}
+        params = {"db":"pubmed","retmode":"json","retmax":"5","term": q}
+        with httpx.Client(timeout=20.0) as client:
+            s = client.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi", params=params).json()
+            ids = ",".join(s.get("esearchresult",{}).get("idlist",[]))
+            if not ids:
+                return {"source":"pubmed","items":[]}
+            summary = client.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+                                 params={"db":"pubmed","retmode":"json","id": ids}).json()
+        items=[]
+        for pmid,meta in summary.get("result",{}).items():
+            if pmid=="uids": continue
+            items.append({
+                "id": pmid,
+                "title": meta.get("title",""),
+                "summary": "; ".join([au.get("name","") for au in meta.get("authors",[])[:3]]),
+                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                "tags":["paper"]
+            })
+        return {"source":"pubmed","items":items}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"pubmed error: {e}")
 
+# ClinicalTrials.gov
 @app.post("/mcps/clinicaltrials")
-def mcps_clinicaltrials(body: MCPReq, authorization: str | None = Header(None)):
+def mcps_trials(body: MCPReq, authorization: str | None = Header(None)):
     if unauthorized(authorization):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    return {"source":"clinicaltrials","items":[
-        {"id":"nct_demo_1","title":"SHP2 inhibitor trial (KRAS)","summary":"Phase I dose escalation.","url":"https://clinicaltrials.gov/study/NCT00000001","tags":["trial"]},
-        {"id":"nct_demo_2","title":"KRASi + SHP2i combo","summary":"Phase II signal seeking.","url":"https://clinicaltrials.gov/study/NCT00000002","tags":["trial"]}
-    ]}
+    try:
+        q = body.query.strip()
+        if not q:
+            return {"source":"clinicaltrials","items":[]}
+        with httpx.Client(timeout=20.0) as client:
+            r = client.get("https://clinicaltrials.gov/api/v2/studies",
+                           params={"query.term": q, "pageSize": 5}).json()
+        items=[]
+        for st in r.get("studies",[]):
+            idn = st.get("identificationModule",{})
+            prot = st.get("protocolSection",{})
+            items.append({
+                "id": idn.get("nctId",""),
+                "title": idn.get("officialTitle") or idn.get("briefTitle",""),
+                "summary": prot.get("statusModule",{}).get("overallStatus",""),
+                "url": f"https://clinicaltrials.gov/study/{idn.get('nctId','')}",
+                "tags":["trial"]
+            })
+        return {"source":"clinicaltrials","items":items}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"trials error: {e}")
 
+# OpenTargets (search targets)
 @app.post("/mcps/opentargets")
 def mcps_opentargets(body: MCPReq, authorization: str | None = Header(None)):
     if unauthorized(authorization):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    return {"source":"opentargets","items":[
-        {"id":"ot_demo_1","title":"PTPN11 disease associations","summary":"Strong associations.","url":"https://platform.opentargets.org/target/ENSG00000179295","tags":["opentargets"]},
-        {"id":"ot_demo_2","title":"PTPN11 pathway links","summary":"RAS/MAPK links.","url":"https://platform.opentargets.org","tags":["opentargets"]}
-    ]}
+    try:
+        q = body.query.strip()
+        if not q:
+            return {"source":"opentargets","items":[]}
+        query = """
+        query Q($q:String!){ search(query:$q){ hits{ id name entity object{ ... on Target { approvedSymbol approvedName } } } } }
+        """
+        payload = {"query":query,"variables":{"q": q}}
+        with httpx.Client(timeout=20.0) as client:
+            r = client.post("https://api.platform.opentargets.org/api/v4/graphql", json=payload).json()
+        items=[]
+        for hit in r.get("data",{}).get("search",{}).get("hits",[])[:5]:
+            tgt = hit.get("object",{})
+            sym = tgt.get("approvedSymbol") or hit.get("name") or ""
+            ensg = hit.get("id") or ""
+            items.append({
+                "id": ensg,
+                "title": f"{sym} ({ensg})",
+                "summary": tgt.get("approvedName",""),
+                "url": f"https://platform.opentargets.org/target/{ensg}",
+                "tags":["opentargets"]
+            })
+        return {"source":"opentargets","items":items}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"opentargets error: {e}")
