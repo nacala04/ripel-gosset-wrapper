@@ -1,6 +1,6 @@
 from typing import List, Dict
 import json
-from utils import (
+from .utils import (
     ask_claude, 
     process_anthropic_response
 )
