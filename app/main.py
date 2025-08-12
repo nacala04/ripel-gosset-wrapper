@@ -2,13 +2,10 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 import os, uuid
 
-# Import the Gosset web-research agent you pasted into web_research_agent/
-from web_research_agent.agent import process_task
-
 API_KEY = os.getenv("PROGRAM_FINDER_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-app = FastAPI(title="RIPEL + Gosset Wrapper (Live)", version="0.2")
+app = FastAPI(title="RIPEL + Gosset Wrapper (Safe Import)", version="0.3")
 
 # -------- Models --------
 class QueryBody(BaseModel):
@@ -27,7 +24,7 @@ def health():
 def unauthorized(auth: str | None):
     return (not API_KEY) or (auth != f"Bearer {API_KEY}")
 
-# -------- Web Research Agent (LIVE) --------
+# -------- Web Research Agent (LIVE, safe import) --------
 @app.post("/gosset/research")
 def gosset_research(body: QueryBody, authorization: str | None = Header(None)):
     if unauthorized(authorization):
@@ -36,15 +33,18 @@ def gosset_research(body: QueryBody, authorization: str | None = Header(None)):
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not set in Railway Variables")
 
+    # Import inside the handler so startup never crashes
     try:
-        # Call Gosset's agent with your query
+        from web_research_agent.agent import process_task
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gosset import error: {e}")
+
+    try:
         data = process_task(
             body.query,
             max_searches=body.max_searches,
             max_results=body.max_results
         )
-
-        # Normalize to a stable shape for your UI
         items = []
         for r in data.get("results", []):
             items.append({
@@ -58,12 +58,10 @@ def gosset_research(body: QueryBody, authorization: str | None = Header(None)):
                 "confidence": 0.6
             })
         return {"query_id": str(uuid.uuid4()), "results": items}
-
     except Exception as e:
-        # If anything goes wrong inside the agent, surface it clearly
         raise HTTPException(status_code=500, detail=f"Gosset agent error: {e}")
 
-# -------- MCPS placeholders (still sample; can go live later) --------
+# -------- MCPS placeholders (can be made live later) --------
 @app.post("/mcps/pubmed")
 def mcps_pubmed(body: MCPReq, authorization: str | None = Header(None)):
     if unauthorized(authorization):
